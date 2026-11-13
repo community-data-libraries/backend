@@ -26,7 +26,9 @@ python pythonscripts/import_sources_to_sqlite.py all
 node server.mjs
 ```
 
-Re-run the import after editing YAML or running pipeline scripts (`tagdataset.py`, `variableextraction.py`, etc.) so the API reflects changes.
+Re-run the import after editing YAML or running pipeline scripts (`tagdataset.py`, `variableextraction.py`, etc.) so the API reflects changes. To remove a dataset, delete its YAML and re-run `all`: a full import also deletes sources that are no longer imported.
+
+The catalog is local data: a source whose `filters` show no state, county or ZIP breakdown stays in the YAML and SQLite but is left out of the catalog export and the API, and a source with no `filters` stops the import. Each downloadable source also declares its file type in `download.format` (for example `csv` or `zip/accdb`). Details: [docs/PIPELINE.md](docs/PIPELINE.md).
 
 Then export the database for the website and commit the result:
 

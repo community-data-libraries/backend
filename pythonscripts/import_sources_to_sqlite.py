@@ -18,8 +18,10 @@ from typing import Any
 
 import yaml
 
+from catalog_scope import is_national_level, missing_filters_message
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+
+SCRIPT_DIR =Path(__file__).resolve().parent
 DEFAULT_SOURCES_DIR = SCRIPT_DIR.parent / "data" / "sources"
 DEFAULT_DB_PATH = SCRIPT_DIR.parent / "database" / "sources.db"
 DEFAULT_SCHEMA_PATH = SCRIPT_DIR.parent / "database" / "schema.sql"
@@ -50,15 +52,22 @@ ADDED_SOURCE_COLUMNS = {
     "about": "TEXT",
     "published_date": "TEXT",
     "geographic_granularity": "TEXT CHECK (geographic_granularity IN "
-    "('nation', 'state', 'county', 'zip', 'point'))",
+    "('nation', 'state', 'county', 'tract', 'zip', 'point'))",
     "student_suitability": "TEXT NOT NULL DEFAULT 'unreviewed' CHECK (student_suitability IN "
     "('suitable', 'not_suitable', 'unreviewed'))",
+    "download_format": "TEXT",
     "download_sheet": "TEXT",
     "download_header_row": "INTEGER CHECK (download_header_row >= 1)",
 }
 
-GRANULARITY_LEVELS = ("nation", "state", "county", "zip", "point")
+GRANULARITY_LEVELS = ("nation", "state", "county", "tract", "zip", "point")
 STUDENT_SUITABILITY_VALUES = ("suitable", "not_suitable", "unreviewed")
+# download.format: the file download.url returns, as export_previews.py detects it.
+# A zip is written zip/<type of the file inside>.
+DOWNLOAD_FORMATS = (
+    "csv", "tsv", "xlsx", "xls", "accdb",
+    "zip/csv", "zip/tsv", "zip/xlsx", "zip/xls", "zip/accdb",
+)
 COVERAGE_FIPS_LENGTH = {"state": 2, "county": 5}
 
 
@@ -68,6 +77,28 @@ def apply_schema(conn: sqlite3.Connection, schema_path: Path) -> None:
     for column, definition in ADDED_SOURCE_COLUMNS.items():
         if column not in existing:
             conn.execute(f"ALTER TABLE sources ADD COLUMN {column} {definition}")
+    allow_tract_granularity(conn)
+
+
+def allow_tract_granularity(conn: sqlite3.Connection) -> None:
+    """SQLite can't alter a CHECK, so an older database file rebuilds `sources` to accept 'tract'."""
+    sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'").fetchone()[0]
+    if "'tract'" in sql:
+        return
+    rebuilt = sql.replace("CREATE TABLE sources", "CREATE TABLE sources_rebuilt", 1).replace(
+        "'county', 'zip'", "'county', 'tract', 'zip'"
+    )
+    conn.commit()
+    conn.executescript(
+        f"""
+        BEGIN;
+        {rebuilt};
+        INSERT INTO sources_rebuilt SELECT * FROM sources;
+        DROP TABLE sources;
+        ALTER TABLE sources_rebuilt RENAME TO sources;
+        COMMIT;
+        """
+    )
 
 
 def as_bool(value: Any) -> int | None:
@@ -148,6 +179,18 @@ def load_granularity(doc: dict[str, Any]) -> str | None:
         raise ValueError(
             f"geographic_granularity must be one of {', '.join(GRANULARITY_LEVELS)}; got {value!r}"
         )
+    return value
+
+
+def load_download_format(download: dict[str, Any]) -> str | None:
+    value = as_text(download.get("format"))
+    if value is None:
+        return None
+    value = value.lower()
+    if value not in DOWNLOAD_FORMATS:
+        raise ValueError(f"download.format must be one of {', '.join(DOWNLOAD_FORMATS)}; got {value!r}")
+    if not as_text(download.get("url")):
+        raise ValueError("download.format needs a download.url")
     return value
 
 
@@ -235,6 +278,19 @@ def delete_source_children(conn: sqlite3.Connection, source_id: str) -> None:
         conn.execute(f"DELETE FROM {table} WHERE source_id = ?", (source_id,))
 
 
+def prune_sources(conn: sqlite3.Connection, keep: set[str]) -> list[str]:
+    """Delete sources (and their child rows) whose id is not in `keep`; return the ids removed.
+
+    Run after a full import so a deleted or refused YAML can't reach the catalog export
+    from a stale database row.
+    """
+    stale = sorted(row[0] for row in conn.execute("SELECT id FROM sources") if row[0] not in keep)
+    for source_id in stale:
+        delete_source_children(conn, source_id)
+        conn.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+    return stale
+
+
 def import_source(
     conn: sqlite3.Connection,
     path: Path,
@@ -259,6 +315,7 @@ def import_source(
     download_sheet, download_header_row = load_download_layout(download)
     coverage = load_coverage(doc)
     location = load_location(doc)
+    download_format = load_download_format(download)
 
     delete_source_children(conn, source_id)
 
@@ -270,8 +327,9 @@ def import_source(
             download_url, download_description, download_file_size,
             download_sheet, download_header_row,
             requires_account, sensitive, pipeline_ready, imported_at,
-            description, about, published_date, geographic_granularity, student_suitability
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            description, about, published_date, geographic_granularity, student_suitability,
+            download_format
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             source_id,
@@ -296,6 +354,7 @@ def import_source(
             as_text(doc.get("published_date")),
             granularity,
             student_suitability,
+            download_format,
         ),
     )
 
@@ -381,10 +440,19 @@ def import_source(
     return source_id, bool(pipeline_ready)
 
 
-def import_files(paths: list[Path], db_path: Path, schema_path: Path) -> None:
+def filters_by_source(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    rows = conn.execute("SELECT source_id, state, county, zipcode FROM source_filters")
+    return {row[0]: {"state": row[1], "county": row[2], "zipcode": row[3]} for row in rows}
+
+
+def import_files(paths: list[Path], db_path: Path, schema_path: Path, *, prune: bool = False) -> list[str]:
+    """Import `paths`. With prune=True (a full import), also delete every other source.
+
+    Returns the imported sources that have no filters.
+    """
     if not paths:
         print("No YAML files found.")
-        return
+        return []
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
     imported_at = datetime.now(timezone.utc).isoformat()
@@ -396,10 +464,12 @@ def import_files(paths: list[Path], db_path: Path, schema_path: Path) -> None:
         imported = 0
         pipeline_ready_count = 0
         skipped: list[str] = []
+        imported_ids: set[str] = set()
 
         for path in paths:
             try:
                 source_id, ready = import_source(conn, path, imported_at)
+                imported_ids.add(source_id)
                 imported += 1
                 if ready:
                     pipeline_ready_count += 1
@@ -408,7 +478,12 @@ def import_files(paths: list[Path], db_path: Path, schema_path: Path) -> None:
                 skipped.append(f"{path.name}: {exc}")
                 print(f"  Skipped: {path.name} — {exc}")
 
+        pruned = prune_sources(conn, imported_ids) if prune else []
         conn.commit()
+
+        filters = filters_by_source(conn)
+        missing = sorted(imported_ids - filters.keys())
+        national = sorted(s for s in imported_ids & filters.keys() if is_national_level(filters[s]))
 
         incomplete = imported - pipeline_ready_count
         print()
@@ -419,7 +494,14 @@ def import_files(paths: list[Path], db_path: Path, schema_path: Path) -> None:
             print(f"Skipped: {len(skipped)}")
             for item in skipped:
                 print(f"  - {item}")
+        if pruned:
+            print(f"Removed (no longer imported): {', '.join(pruned)}")
+        if national:
+            print(f"National-level, left out of the catalog export: {', '.join(national)}")
+        if missing:
+            print(f"ERROR: {missing_filters_message(missing)}")
         print(f"Database: {db_path}")
+        return missing
     finally:
         conn.close()
 
@@ -440,7 +522,9 @@ def main() -> None:
         sys.exit(1)
 
     print(f"Found {len(paths)} file(s)")
-    import_files(paths, DEFAULT_DB_PATH, DEFAULT_SCHEMA_PATH)
+    missing = import_files(paths, DEFAULT_DB_PATH, DEFAULT_SCHEMA_PATH, prune=target == "all")
+    if missing:
+        sys.exit(1)
     print("Done.")
 
 

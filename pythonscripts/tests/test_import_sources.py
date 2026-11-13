@@ -7,9 +7,11 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
-SCRIPTS = Path(__file__).resolve().parents[1]
+SCRIPTS =Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 import import_sources_to_sqlite as importer  # noqa: E402
@@ -100,6 +102,44 @@ class ImportSourcesTest(unittest.TestCase):
         conn = self.run_import(*paths)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 0)
 
+    def test_national_level_sources_stay_in_sqlite(self) -> None:
+        path = self.write("us.yml", "id: us-totals\ntitle: US\ngeographic_granularity: nation\nfilters: {year: true}\n")
+        self.assertEqual(importer.import_files([path], self.db, SCHEMA), [])
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT id FROM sources").fetchall(), [("us-totals",)])
+
+    def test_a_source_without_filters_is_reported(self) -> None:
+        path = self.write("n.yml", "id: no-filters\ntitle: N\n")
+        self.assertEqual(importer.import_files([path], self.db, SCHEMA), ["no-filters"])
+
+    def test_full_import_fails_on_missing_filters(self) -> None:
+        self.write("n.yml", "id: no-filters\ntitle: N\n")
+        with patch.object(importer, "DEFAULT_SOURCES_DIR", self.dir), patch.object(importer, "DEFAULT_DB_PATH", self.db):
+            with patch.object(sys, "argv", ["import", "all"]), self.assertRaises(SystemExit) as stopped:
+                importer.main()
+        self.assertEqual(stopped.exception.code, 1)
+
+    def test_national_coverage_with_local_granularity_imports(self) -> None:
+        path = self.write("c.yml", "id: c\ntitle: C\ngeographic_granularity: county\ncoverage:\n  - level: nation\n")
+        importer.import_files([path], self.db, SCHEMA)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT id, geographic_granularity FROM sources").fetchall(), [("c", "county")])
+
+    def test_download_format_is_stored(self) -> None:
+        path = self.write("z.yml", "id: z\ntitle: Z\ndownload:\n  url: https://example.gov/z.zip\n  format: ZIP/CSV\n")
+        importer.import_files([path], self.db, SCHEMA)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT download_format FROM sources").fetchone(), ("zip/csv",))
+
+    def test_invalid_download_format_skips_the_source(self) -> None:
+        paths = [
+            self.write("pdf.yml", "id: pdf\ntitle: P\ndownload:\n  url: https://example.gov/p.pdf\n  format: pdf\n"),
+            self.write("nourl.yml", "id: nourl\ntitle: N\ndownload:\n  format: csv\n"),
+        ]
+        importer.import_files(paths, self.db, SCHEMA)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 0)
+
     def test_excel_layout_fields_are_stored(self) -> None:
         conn = self.run_import(self.write("x.yml", """
             id: x
@@ -125,6 +165,52 @@ class ImportSourcesTest(unittest.TestCase):
         path.write_text("id: s\ntitle: S\ncoverage:\n  - level: state\n    fips: '47'\n", encoding="utf-8")
         conn = self.run_import(path)
         self.assertEqual(conn.execute("SELECT level, geoid FROM source_coverage").fetchall(), [("state", "47")])
+
+    def test_full_import_removes_sources_whose_yaml_is_gone(self) -> None:
+        keep = self.write("keep.yml", "id: keep\ntitle: Keep\ncoverage:\n  - level: nation\n")
+        gone = self.write("gone.yml", "id: gone\ntitle: Gone\ncoverage:\n  - level: nation\n")
+        importer.import_files([keep, gone], self.db, SCHEMA, prune=True)
+        gone.unlink()
+        importer.import_files([keep], self.db, SCHEMA, prune=True)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT id FROM sources").fetchall(), [("keep",)])
+            self.assertEqual(conn.execute("SELECT source_id FROM source_coverage").fetchall(), [("keep",)])
+
+    def test_full_import_removes_sources_that_no_longer_import(self) -> None:
+        path = self.write("s.yml", "id: s\ntitle: S\n")
+        importer.import_files([path], self.db, SCHEMA, prune=True)
+        path.write_text("id: s\ntitle: S\ngeographic_granularity: planet\n", encoding="utf-8")
+        importer.import_files([path], self.db, SCHEMA, prune=True)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 0)
+
+    def test_single_file_import_keeps_other_sources(self) -> None:
+        first = self.write("a.yml", "id: a\ntitle: A\n")
+        second = self.write("b.yml", "id: b\ntitle: B\n")
+        importer.import_files([first, second], self.db, SCHEMA, prune=True)
+        importer.import_files([first], self.db, SCHEMA)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT id FROM sources ORDER BY id").fetchall(), [("a",), ("b",)])
+
+    def test_existing_database_accepts_tract_granularity(self) -> None:
+        old_schema = SCHEMA.read_text(encoding="utf-8").replace("'county', 'tract', 'zip'", "'county', 'zip'")
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.executescript(old_schema)
+            conn.execute(
+                "INSERT INTO sources (id, yml_filename, geographic_granularity, imported_at) "
+                "VALUES ('old', 'old.yml', 'county', 'then')"
+            )
+            conn.execute("INSERT INTO source_coverage (source_id, level, geoid) VALUES ('old', 'nation', 'US')")
+            conn.commit()
+        path = self.write("t.yml", "id: t\ntitle: T\ngeographic_granularity: tract\n")
+        importer.import_files([path], self.db, SCHEMA)
+        importer.import_files([path], self.db, SCHEMA)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(
+                conn.execute("SELECT id, geographic_granularity FROM sources ORDER BY id").fetchall(),
+                [("old", "county"), ("t", "tract")],
+            )
+            self.assertEqual(conn.execute("SELECT source_id FROM source_coverage").fetchall(), [("old",)])
 
     def test_existing_database_gets_new_columns(self) -> None:
         conn = sqlite3.connect(self.db)

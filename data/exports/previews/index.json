@@ -1,20 +1,9 @@
 {
   "version": 1,
   "sources": {
-    "census-annual-pop-by-age-sex-2025": {
-      "status": "ok",
-      "rows": 306,
-      "counties": 0,
-      "tier2": false
-    },
-    "census-annual-pop-selected-age-groups-2024": {
-      "status": "ok",
-      "rows": 19,
-      "counties": 0,
-      "tier2": false
-    },
     "census-county-estimates-all-2025": {
       "status": "ok",
+      "format": "csv",
       "rows": 3195,
       "counties": 3144,
       "tier2": false
@@ -25,24 +14,28 @@
     },
     "census-resident-pop-18plus-2025": {
       "status": "ok",
+      "format": "xlsx",
       "rows": 56,
       "counties": 0,
       "tier2": false
     },
     "census-state-estimates-all-2025": {
       "status": "ok",
+      "format": "csv",
       "rows": 66,
       "counties": 0,
       "tier2": false
     },
     "census-state-pop-change-2020-2025": {
       "status": "ok",
+      "format": "csv",
       "rows": 66,
       "counties": 0,
       "tier2": false
     },
     "chr-analytic-data-2025": {
       "status": "ok",
+      "format": "csv",
       "rows": 3204,
       "counties": 3144,
       "tier2": true
@@ -57,6 +50,7 @@
     },
     "epa-airtoxscreen-county": {
       "status": "none",
+      "format": "zip/accdb",
       "reason": "unsupported format: zip contains no CSV (.accdb)"
     },
     "epa-tri-basic-data": {
@@ -65,6 +59,7 @@
     },
     "epa-tri-basic-data-tn-2024": {
       "status": "ok",
+      "format": "csv",
       "rows": 2107,
       "counties": 81,
       "tier2": true
@@ -101,11 +96,21 @@
       "status": "none",
       "reason": "no direct download"
     },
-    "usda-milk-production": {
-      "status": "ok",
-      "rows": 710,
-      "counties": 0,
-      "tier2": false
+    "nanda-grocery-food-stores": {
+      "status": "none",
+      "reason": "no direct download"
+    },
+    "nanda-libraries": {
+      "status": "none",
+      "reason": "no direct download"
+    },
+    "nanda-voter-turnout-partisanship-by-county": {
+      "status": "none",
+      "reason": "no direct download"
+    },
+    "nanda-weather-by-county": {
+      "status": "none",
+      "reason": "no direct download"
     }
   }
 }

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import textwrap
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,6 +31,8 @@ class ExportCatalogTest(unittest.TestCase):
             title: A Source
             description: Card text.
             provider: {name: Agency, url: "https://example.gov"}
+            filters: {year: false, state: true, county: true, zipcode: false}
+            download: {url: "https://example.gov/a.zip", format: zip/xlsx}
             sensitive: false
             student_suitability: not_suitable
             geographic_granularity: county
@@ -38,7 +42,7 @@ class ExportCatalogTest(unittest.TestCase):
             pedagogical_tags: {civic-education: true}
         """), encoding="utf-8")
         plain = self.dir / "b.yml"
-        plain.write_text("id: b-source\ntitle: B Source\n", encoding="utf-8")
+        plain.write_text("id: b-source\ntitle: B Source\nfilters: {zipcode: true}\n", encoding="utf-8")
         importer.import_files([yml, plain], self.db, SCHEMA)
 
     def tearDown(self) -> None:
@@ -53,6 +57,8 @@ class ExportCatalogTest(unittest.TestCase):
         self.assertEqual(a["location"], {"latitude": 35.99, "longitude": -83.94, "label": "Knox"})
         self.assertEqual(a["student_suitability"], "not_suitable")
         self.assertEqual(a["geographic_granularity"], "county")
+        self.assertEqual(a["download"], {"url": "https://example.gov/a.zip", "format": "zip/xlsx"})
+        self.assertNotIn("download", b)
         self.assertEqual(a["description_tags"], ["education", "housing"])
         self.assertEqual(a["analysis_tags"], {"pedagogical_tags": {"civic-education": True}})
         self.assertIs(a["sensitive"], False)
@@ -63,15 +69,15 @@ class ExportCatalogTest(unittest.TestCase):
     def test_export_sheet_and_header_row(self) -> None:
         named = self.dir / "c.yml"
         named.write_text(
-            'id: c-source\ntitle: C\ndownload: {url: "https://x.gov/a.xlsx", sheet: Data, header_row: 4}\n',
+            'id: c-source\ntitle: C\ndownload: {url: "https://x.gov/a.xlsx", sheet: Data, header_row: 4}\nfilters: {county: true}\n',
             encoding="utf-8",
         )
         indexed = self.dir / "d.yml"
         indexed.write_text(
-            'id: d-source\ntitle: D\ndownload: {url: "https://x.gov/a.xlsx", sheet: 1}\n', encoding="utf-8"
+            'id: d-source\ntitle: D\ndownload: {url: "https://x.gov/a.xlsx", sheet: 1}\nfilters: {county: true}\n', encoding="utf-8"
         )
         unset = self.dir / "e.yml"
-        unset.write_text('id: e-source\ntitle: E\ndownload: {url: "https://x.gov/a.csv"}\n', encoding="utf-8")
+        unset.write_text('id: e-source\ntitle: E\ndownload: {url: "https://x.gov/a.csv"}\nfilters: {county: true}\n', encoding="utf-8")
         importer.import_files([named, indexed, unset], self.db, SCHEMA)
         by_id = {s["id"]: s for s in export_catalog.build_export(self.db)["sources"]}
         self.assertEqual(by_id["c-source"]["download"]["sheet"], "Data")
@@ -89,6 +95,25 @@ class ExportCatalogTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotIn("imported_at", first)
         json.loads(first)
+
+    def add_source(self, body: str) -> None:
+        path = self.dir / "extra.yml"
+        path.write_text(body, encoding="utf-8")
+        importer.import_files([path], self.db, SCHEMA)
+
+    def test_national_level_sources_are_left_out_but_stay_in_sqlite(self) -> None:
+        self.add_source("id: us-totals\ntitle: US\nfilters: {year: true, state: false, county: false, zipcode: false}\n")
+        export = export_catalog.build_export(self.db)
+        self.assertEqual([s["id"] for s in export["sources"]], ["a-source", "b-source"])
+        self.assertEqual(export["sourceCount"], 2)
+        self.assertEqual(export["excludedNationalLevel"], ["us-totals"])
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT id FROM sources WHERE id = 'us-totals'").fetchone(), ("us-totals",))
+
+    def test_a_source_without_filters_stops_the_export(self) -> None:
+        self.add_source("id: no-filters\ntitle: N\n")
+        with self.assertRaisesRegex(ValueError, "no-filters"):
+            export_catalog.build_export(self.db)
 
 
 if __name__ == "__main__":
